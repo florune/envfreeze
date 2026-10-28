@@ -10,16 +10,36 @@ use windows::core::PCWSTR;
 
 use crate::win::wide;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// 所有环境共用的冻结白名单（进程映像名，支持 `*` `?` 通配符）。
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub hotkeys: Hotkeys,
     #[serde(default)]
     pub environments: BTreeMap<String, Environment>,
 }
 
-#[derive(Debug, Deserialize)]
+/// 托盘程序的全局快捷键，格式如 `Ctrl+Alt+1`。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hotkeys {
+    /// 打开面板。
+    pub panel: Option<String>,
+    /// 冻结所有运行中的环境。
+    pub freeze_all: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Environment {
+    /// 切换到此环境的快捷键。
+    pub hotkey: Option<String>,
+    /// 本环境额外的冻结白名单。
+    #[serde(default)]
+    pub exclude: Vec<String>,
     #[serde(default)]
     pub programs: Vec<Program>,
 }
@@ -68,6 +88,21 @@ impl Config {
     }
 }
 
+/// 示例配置，配置文件不存在时用它生成一份。
+pub const EXAMPLE: &str = include_str!("../envfreeze.example.toml");
+
+/// 配置文件不存在时写入示例配置，返回是否新建了文件。
+pub fn ensure_exists(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, EXAMPLE).with_context(|| format!("创建配置文件 {} 失败", path.display()))?;
+    Ok(true)
+}
+
 /// 环境名会成为内核对象名的一部分，只允许安全字符。
 pub fn validate_env_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
@@ -108,9 +143,10 @@ mod tests {
 
     #[test]
     fn parses_example_config() {
-        let text = include_str!("../envfreeze.example.toml");
-        let config: Config = toml::from_str(text).unwrap();
+        let config: Config = toml::from_str(EXAMPLE).unwrap();
         assert!(!config.environments.is_empty());
+        assert!(config.hotkeys.panel.is_some());
+        assert!(config.environments["proj-a"].hotkey.is_some());
     }
 
     #[test]

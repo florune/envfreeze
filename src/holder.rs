@@ -46,7 +46,20 @@ fn report(kind: &str, msg: &str) {
     let _ = out.flush();
 }
 
-pub fn run(config_path: &Path, env: &str) -> Result<()> {
+/// holder 进程入口（命令行和托盘程序的 `__hold` 子命令）。
+/// holder 没有控制台，日志追加到 `%LOCALAPPDATA%\envfreeze\logs\<环境名>.log`。
+pub fn main(config_path: &Path, env: &str) -> Result<()> {
+    config::validate_env_name(env)?;
+    let path = crate::paths::holder_log(env)?;
+    std::fs::create_dir_all(path.parent().expect("日志文件必有父目录"))?;
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("envfreeze=debug"));
+    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
+    run(config_path, env)
+}
+
+fn run(config_path: &Path, env: &str) -> Result<()> {
     info!(env, config = %config_path.display(), "holder 启动");
     let result = launch_all(config_path, env);
     if let Err(e) = &result {
@@ -115,7 +128,13 @@ fn spawn_in_job(job: &Job, program: &Program) -> Result<Process> {
     let path = config::expand(&program.path);
     let args: Vec<String> = program.args.iter().map(|a| config::expand(a)).collect();
     let mut command_line = wide(build_command_line(&path, &args));
-    let cwd = program.cwd.as_deref().map(|c| wide(config::expand_path(c)));
+    // 没配工作目录时用用户主目录，而不是继承 holder 的（那是执行 launch 时所在的任意目录，
+    // 有些程序会往工作目录里写文件）。
+    let cwd = match program.cwd.as_deref() {
+        Some(c) => Some(config::expand_path(c)),
+        None => dirs::home_dir(),
+    }
+    .map(wide);
     let env_block = (!program.env.is_empty()).then(|| build_env_block(&program.env));
     debug!(path, ?args, cwd = program.cwd.as_deref(), "CreateProcessW");
 

@@ -8,8 +8,23 @@
 #   cwd   工作目录（可选）
 #   env   额外环境变量（可选），覆盖继承来的同名变量
 # path / args / cwd / env 的值都支持 %VAR% 展开。
+#
+# 快捷键和白名单都可以在托盘面板里修改，面板只改动对应的键，会保留这里的注释。
+
+# 全局冻结白名单：这些进程在任何环境里都不会被冻结。
+# 按进程映像名匹配，不区分大小写，支持 * ? 通配符；不写扩展名也能匹配 .exe。
+exclude = []
+
+# 托盘程序的全局快捷键（修饰键 Ctrl / Alt / Shift / Win + 一个按键）
+[hotkeys]
+panel = "Ctrl+Alt+Space"    # 打开面板
+freeze_all = "Ctrl+Alt+0"   # 冻结所有运行中的环境
 
 # ---------- 环境 proj-a ----------
+
+[environments.proj-a]
+hotkey = "Ctrl+Alt+1"       # 切换到此环境：冻结其他环境，再启动或恢复本环境
+exclude = ["navicat"]       # 本环境额外的白名单，例如冻结时让 Navicat 保持运行
 
 # GoLand 是单实例程序：不隔离的话，第二个环境里启动的 goland64.exe 会把项目
 # 交给第一个环境的 GoLand 进程后立即退出。通过 GOLAND_PROPERTIES 给每个环境
@@ -35,6 +50,9 @@ args = ['-NoExit', '-Command', 'Set-Location D:\code\proj-a']
 cwd = 'D:\code\proj-a'
 
 # ---------- 环境 proj-b ----------
+
+[environments.proj-b]
+hotkey = "Ctrl+Alt+2"
 
 [[environments.proj-b.programs]]
 name = "GoLand"

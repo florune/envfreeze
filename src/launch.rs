@@ -16,43 +16,72 @@ use crate::holder;
 use crate::job::Job;
 use crate::{paths, state};
 
-/// 返回是否所有程序都启动成功。
-pub fn run(config_path: &Path, env: &str) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Ok,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaunchReport {
+    pub env: String,
+    pub lines: Vec<(Level, String)>,
+}
+
+impl LaunchReport {
+    pub fn ok(&self) -> bool {
+        !self.lines.iter().any(|(level, _)| *level == Level::Error)
+    }
+
+    pub fn summary(&self) -> String {
+        let count = |l| self.lines.iter().filter(|(level, _)| *level == l).count();
+        let mut s = format!("{}：启动 {} 个程序", self.env, count(Level::Ok));
+        if count(Level::Error) > 0 {
+            s += &format!("，失败 {} 个", count(Level::Error));
+        }
+        if count(Level::Warn) > 0 {
+            s += &format!("，警告 {} 条", count(Level::Warn));
+        }
+        s
+    }
+}
+
+pub fn launch(config_path: &Path, env: &str) -> Result<LaunchReport> {
     // 先在前台校验配置，错误能直接显示给用户。
     Config::load(config_path)?.env(env)?;
     if Job::open(env)?.is_some() {
         bail!("环境 `{env}` 已在运行");
     }
-    // 环境没在运行，之前的冻结记录已经过期。
-    state::clear(env)?;
+    if state::read(env)?.is_some() {
+        bail!("环境 `{env}` 有残留的冻结记录（之前的进程可能仍被挂起），请先执行 thaw");
+    }
 
     let mut child = spawn_holder(config_path, env)?;
     let stdout = child.stdout.take().expect("stdout 已设置为管道");
 
-    let mut ok = true;
+    let mut report = LaunchReport { env: env.to_owned(), lines: Vec::new() };
     let mut finished = false;
     for line in BufReader::new(stdout).lines() {
         let line = line.context("读取 holder 输出失败")?;
         let (kind, msg) = line.split_once('\t').unwrap_or((line.as_str(), ""));
-        match kind {
+        let level = match kind {
             holder::DONE => {
                 finished = true;
                 break;
             }
-            "OK" => println!("  ✓ {msg}"),
-            "WARN" => println!("  ! {msg}"),
-            _ => {
-                ok = false;
-                println!("  ✗ {msg}");
-            }
-        }
+            "OK" => Level::Ok,
+            "WARN" => Level::Warn,
+            _ => Level::Error,
+        };
+        report.lines.push((level, msg.to_owned()));
     }
     if !finished {
         bail!("holder 意外退出，详见日志 {}", paths::holder_log(env)?.display());
     }
     // 不等待 holder：它会一直运行到环境中的进程全部退出。
     drop(child);
-    Ok(ok)
+    Ok(report)
 }
 
 fn spawn_holder(config_path: &Path, env: &str) -> Result<std::process::Child> {

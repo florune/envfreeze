@@ -1,6 +1,6 @@
 //! `freeze` / `thaw`：挂起或恢复环境 Job 中的全部进程。
 //!
-//! 单个进程失败不会中断流程：继续处理其余进程，最后汇总报错。
+//! 单个进程失败不会中断流程：继续处理其余进程，最后在报告中汇总。
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -12,9 +12,10 @@ use windows::Win32::System::Threading::{
     PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME,
 };
 
+use crate::exclude::ExcludeRules;
 use crate::guard;
 use crate::job::Job;
-use crate::memory::{self, Memory, fmt_bytes, fmt_delta};
+use crate::memory::{self, Memory, fmt_bytes};
 use crate::process::Process;
 use crate::state::{self, FrozenProcess};
 use crate::win::{describe, is_win32};
@@ -27,10 +28,94 @@ const THAW_ACCESS: PROCESS_ACCESS_RIGHTS =
 /// 挂起过程中进程可能继续派生子进程，反复枚举直到没有新 PID，最多这么多轮。
 const MAX_ROUNDS: usize = 10;
 
-struct Failure {
-    pid: u32,
-    name: String,
-    error: String,
+#[derive(Debug, Clone)]
+pub struct Failure {
+    pub pid: u32,
+    pub name: String,
+    pub error: String,
+}
+
+/// 没有冻结的进程及原因（系统白名单或用户白名单）。
+#[derive(Debug, Clone)]
+pub struct Skipped {
+    pub pid: u32,
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrozenRow {
+    pub pid: u32,
+    pub name: String,
+    pub before: Memory,
+    pub after: Memory,
+}
+
+#[derive(Debug, Clone)]
+pub struct FreezeReport {
+    pub env: String,
+    /// 环境本来就处于冻结状态，本次什么都没做。
+    pub already_frozen: bool,
+    pub frozen: Vec<FrozenRow>,
+    pub skipped: Vec<Skipped>,
+    pub failures: Vec<Failure>,
+    /// 多轮枚举后仍有新进程出现。
+    pub unstable: bool,
+    pub available_before: Option<u64>,
+    pub available_after: Option<u64>,
+    pub suspend_elapsed: Duration,
+    pub trim_elapsed: Duration,
+}
+
+impl FreezeReport {
+    pub fn ok(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// 工作集释放量。
+    pub fn released(&self) -> u64 {
+        self.frozen.iter().map(|r| r.before.working_set.saturating_sub(r.after.working_set)).sum()
+    }
+
+    pub fn summary(&self) -> String {
+        if self.already_frozen {
+            return format!("{}：已处于冻结状态", self.env);
+        }
+        let mut s = format!("{}：冻结 {} 个进程，释放 {}", self.env, self.frozen.len(), fmt_bytes(self.released()));
+        if !self.skipped.is_empty() {
+            s += &format!("，跳过 {} 个", self.skipped.len());
+        }
+        if !self.failures.is_empty() {
+            s += &format!("，失败 {} 个", self.failures.len());
+        }
+        s
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ThawReport {
+    pub env: String,
+    pub resumed: usize,
+    pub failures: Vec<Failure>,
+    pub elapsed: Duration,
+    /// 恢复前存在冻结记录。
+    pub had_record: bool,
+    /// 找不到 Job，只能按冻结记录恢复。
+    pub job_missing: bool,
+}
+
+impl ThawReport {
+    pub fn ok(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        let mut s = format!("{}：恢复 {} 个进程", self.env, self.resumed);
+        if !self.failures.is_empty() {
+            s += &format!("，失败 {} 个（可重试）", self.failures.len());
+        }
+        s
+    }
 }
 
 struct Suspended {
@@ -41,48 +126,58 @@ struct Suspended {
 
 enum Outcome<T> {
     Done(T),
-    /// 进程已退出或在白名单中，不算失败。
-    Skipped,
+    Skipped(Option<Skipped>),
     Failed(Failure),
 }
 
-/// 返回是否全部成功。
-pub fn freeze(env: &str) -> Result<bool> {
+pub fn freeze(env: &str, rules: &ExcludeRules) -> Result<FreezeReport> {
     let Some(job) = Job::open(env)? else { bail!("环境 `{env}` 未运行") };
+    let mut report = FreezeReport {
+        env: env.to_owned(),
+        already_frozen: false,
+        frozen: Vec::new(),
+        skipped: Vec::new(),
+        failures: Vec::new(),
+        unstable: false,
+        available_before: None,
+        available_after: None,
+        suspend_elapsed: Duration::ZERO,
+        trim_elapsed: Duration::ZERO,
+    };
     if state::read(env)?.is_some() {
-        println!("环境 `{env}` 已处于冻结状态，跳过（重复挂起会导致需要多次恢复）");
-        return Ok(true);
+        // 挂起是计数的，重复冻结会导致需要多次恢复。
+        report.already_frozen = true;
+        return Ok(report);
     }
 
-    let available_before = memory::available_physical();
+    report.available_before = memory::available_physical();
     let started = Instant::now();
     let mut seen = HashSet::new();
     let mut suspended = Vec::new();
-    let mut failures = Vec::new();
-    let mut stable = false;
+    report.unstable = true;
     for round in 0..MAX_ROUNDS {
         let new: Vec<u32> = job.pids()?.into_iter().filter(|pid| seen.insert(*pid)).collect();
         debug!(round, count = new.len(), "本轮新发现的进程");
         if new.is_empty() {
-            stable = true;
+            report.unstable = false;
             break;
         }
         for pid in new {
-            match suspend_one(pid) {
+            match suspend_one(pid, rules) {
                 Outcome::Done(s) => suspended.push(s),
-                Outcome::Skipped => {}
-                Outcome::Failed(f) => failures.push(f),
+                Outcome::Skipped(s) => report.skipped.extend(s),
+                Outcome::Failed(f) => report.failures.push(f),
             }
         }
     }
-    if !stable {
+    if report.unstable {
         warn!("{MAX_ROUNDS} 轮后仍有新进程出现，可能有进程在不断派生子进程");
     }
-    let suspend_elapsed = started.elapsed();
+    report.suspend_elapsed = started.elapsed();
 
     if suspended.is_empty() {
-        print_failures(&failures);
-        bail!("环境 `{env}` 中没有成功挂起的进程");
+        // 全部被跳过或失败：没有挂起任何进程，不写冻结记录。
+        return Ok(report);
     }
     // 先落盘再清空工作集：即使后续步骤出问题，thaw 也知道要恢复哪些进程。
     let records: Vec<FrozenProcess> = suspended.iter().map(|s| s.record.clone()).collect();
@@ -91,63 +186,39 @@ pub fn freeze(env: &str) -> Result<bool> {
     }
 
     let trim_started = Instant::now();
-    let mut rows = Vec::new();
-    for s in &suspended {
+    for s in suspended {
         if let Err(e) = s.process.empty_working_set() {
-            failures.push(Failure {
+            report.failures.push(Failure {
                 pid: s.record.pid,
                 name: s.record.name.clone(),
                 error: format!("清空工作集失败：{}", describe(&e)),
             });
         }
-        rows.push((s, s.process.memory().unwrap_or_default()));
+        let after = s.process.memory().unwrap_or_default();
+        report.frozen.push(FrozenRow { pid: s.record.pid, name: s.record.name, before: s.before, after });
     }
-    let trim_elapsed = trim_started.elapsed();
-    let available_after = memory::available_physical();
-
-    println!("已冻结环境 `{env}`：挂起 {} 个进程", suspended.len());
-    println!("{:>7}  {:>11}  {:>11}  {:>11}  进程", "PID", "工作集(前)", "工作集(后)", "私有提交");
-    for (s, after) in &rows {
-        println!(
-            "{:>7}  {:>11}  {:>11}  {:>11}  {}",
-            s.record.pid,
-            fmt_bytes(s.before.working_set),
-            fmt_bytes(after.working_set),
-            fmt_bytes(after.private),
-            s.record.name
-        );
-    }
-    let before: Memory = rows.iter().map(|(s, _)| s.before).sum();
-    let after: Memory = rows.iter().map(|(_, m)| *m).sum();
-    println!(
-        "{:>7}  {:>11}  {:>11}  {:>11}  工作集变化 {}",
-        "合计",
-        fmt_bytes(before.working_set),
-        fmt_bytes(after.working_set),
-        fmt_bytes(after.private),
-        fmt_delta(before.working_set, after.working_set)
-    );
-    if let (Some(b), Some(a)) = (available_before, available_after) {
-        println!("系统可用物理内存：{} → {}（{}）", fmt_bytes(b), fmt_bytes(a), fmt_delta(b, a));
-        println!("  注：被换出的页面会先进入修改列表/内存压缩，可用内存可能在之后几秒内继续上升");
-    }
-    println!("挂起用时 {}，清空工作集用时 {}", fmt_duration(suspend_elapsed), fmt_duration(trim_elapsed));
-    print_failures(&failures);
-    Ok(failures.is_empty())
+    report.trim_elapsed = trim_started.elapsed();
+    report.available_after = memory::available_physical();
+    Ok(report)
 }
 
-fn suspend_one(pid: u32) -> Outcome<Suspended> {
+fn suspend_one(pid: u32, rules: &ExcludeRules) -> Outcome<Suspended> {
     let process = match open(pid, FREEZE_ACCESS) {
         Outcome::Done(p) => p,
-        Outcome::Skipped => return Outcome::Skipped,
+        Outcome::Skipped(s) => return Outcome::Skipped(s),
         Outcome::Failed(f) => return Outcome::Failed(f),
     };
     let name = process.image_name();
     if let Some(reason) = guard::protected_reason(pid, name.as_deref()) {
         warn!(pid, name = name.as_deref().unwrap_or("?"), "{reason}，不冻结");
-        return Outcome::Skipped;
+        let name = name.unwrap_or_default();
+        return Outcome::Skipped(Some(Skipped { pid, name, reason: reason.into() }));
     }
     let name = name.unwrap_or_else(|| "<未知>".into());
+    if let Some(pattern) = rules.matches(&name) {
+        debug!(pid, name, pattern, "命中用户白名单，不冻结");
+        return Outcome::Skipped(Some(Skipped { pid, name, reason: format!("白名单 `{pattern}`") }));
+    }
     let before = process.memory().unwrap_or_default();
     if let Err(e) = crate::ntdll::suspend(process.handle()) {
         return Outcome::Failed(Failure { pid, name, error: format!("{e:#}") });
@@ -157,8 +228,7 @@ fn suspend_one(pid: u32) -> Outcome<Suspended> {
     Outcome::Done(Suspended { process, record, before })
 }
 
-/// 返回是否全部成功。
-pub fn thaw(env: &str) -> Result<bool> {
+pub fn thaw(env: &str) -> Result<ThawReport> {
     let records = state::read(env)?;
     let job = Job::open(env)?;
 
@@ -179,9 +249,6 @@ pub fn thaw(env: &str) -> Result<bool> {
         }
         (None, None) => bail!("环境 `{env}` 未运行"),
     }
-    if records.is_none() {
-        println!("环境 `{env}` 没有冻结记录，仍对其中所有进程执行一次恢复");
-    }
 
     let started = Instant::now();
     let mut resumed = 0;
@@ -189,39 +256,40 @@ pub fn thaw(env: &str) -> Result<bool> {
     for (pid, expected_created) in targets {
         match resume_one(pid, expected_created) {
             Outcome::Done(()) => resumed += 1,
-            Outcome::Skipped => {}
+            Outcome::Skipped(_) => {}
             Outcome::Failed(f) => failures.push(f),
         }
     }
-    let elapsed = started.elapsed();
-
-    println!("已恢复环境 `{env}`：{resumed} 个进程，用时 {}", fmt_duration(elapsed));
-    println!("  注：内存会在程序被使用时按需换入，首次切回窗口可能有短暂卡顿");
-    print_failures(&failures);
-    if failures.is_empty() {
+    let report = ThawReport {
+        env: env.to_owned(),
+        resumed,
+        failures,
+        elapsed: started.elapsed(),
+        had_record: records.is_some(),
+        job_missing: job.is_none(),
+    };
+    // 有失败时保留记录：恢复一个未挂起的进程没有副作用，可以放心重试。
+    if report.ok() {
         state::clear(env)?;
-    } else {
-        // 保留记录：恢复一个未挂起的进程不会有副作用，可以放心重试。
-        println!("冻结记录已保留，可再次执行 `envfreeze thaw {env}` 重试");
     }
-    Ok(failures.is_empty())
+    Ok(report)
 }
 
 fn resume_one(pid: u32, expected_created: Option<u64>) -> Outcome<()> {
     let process = match open(pid, THAW_ACCESS) {
         Outcome::Done(p) => p,
-        Outcome::Skipped => return Outcome::Skipped,
+        Outcome::Skipped(s) => return Outcome::Skipped(s),
         Outcome::Failed(f) => return Outcome::Failed(f),
     };
     if let Some(expected) = expected_created.filter(|&c| c != 0)
         && process.creation_time() != Some(expected)
     {
         debug!(pid, "PID 已被其他进程复用，跳过");
-        return Outcome::Skipped;
+        return Outcome::Skipped(None);
     }
     let name = process.image_name();
     if guard::protected_reason(pid, name.as_deref()).is_some() {
-        return Outcome::Skipped;
+        return Outcome::Skipped(None);
     }
     let name = name.unwrap_or_else(|| "<未知>".into());
     match crate::ntdll::resume(process.handle()) {
@@ -239,22 +307,8 @@ fn open(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> Outcome<Process> {
         // 枚举之后进程已经退出。
         Err(e) if is_win32(&e, ERROR_INVALID_PARAMETER) => {
             debug!(pid, "进程已退出");
-            Outcome::Skipped
+            Outcome::Skipped(None)
         }
         Err(e) => Outcome::Failed(Failure { pid, name: "<无法打开>".into(), error: describe(&e) }),
     }
-}
-
-fn print_failures(failures: &[Failure]) {
-    if failures.is_empty() {
-        return;
-    }
-    eprintln!("失败 {} 个：", failures.len());
-    for f in failures {
-        eprintln!("  PID {} {}：{}", f.pid, f.name, f.error);
-    }
-}
-
-fn fmt_duration(d: Duration) -> String {
-    if d.as_secs() >= 1 { format!("{:.2} s", d.as_secs_f64()) } else { format!("{} ms", d.as_millis()) }
 }
