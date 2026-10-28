@@ -1,0 +1,49 @@
+# envfreeze 配置示例
+# 默认位置：%APPDATA%\envfreeze\config.toml（或用 --config / 环境变量 ENVFREEZE_CONFIG 指定）
+#
+# 每个程序：
+#   name  显示名（可选，默认取可执行文件名）
+#   path  可执行文件路径。请指向 .exe，不要用 JetBrains Toolbox 生成的 .cmd 脚本
+#   args  参数列表（可选）
+#   cwd   工作目录（可选）
+#   env   额外环境变量（可选），覆盖继承来的同名变量
+# path / args / cwd / env 的值都支持 %VAR% 展开。
+
+# ---------- 环境 proj-a ----------
+
+# GoLand 是单实例程序：不隔离的话，第二个环境里启动的 goland64.exe 会把项目
+# 交给第一个环境的 GoLand 进程后立即退出。通过 GOLAND_PROPERTIES 给每个环境
+# 指定独立的 config/system 目录，每个环境就拥有自己的 GoLand 进程（见 README）。
+[[environments.proj-a.programs]]
+name = "GoLand"
+path = 'D:\idea\GoLand 2026.1\bin\goland64.exe'
+args = ['D:\code\proj-a\api', 'D:\code\proj-a\web', 'D:\code\proj-a\worker']
+env = { GOLAND_PROPERTIES = '%APPDATA%\envfreeze\goland\proj-a\idea.properties' }
+
+# Navicat 同样是单实例，只能放在一个环境里。
+[[environments.proj-a.programs]]
+name = "Navicat"
+path = 'D:\tool\Navicat Premium 17.3.6\navicat.exe'
+
+# 终端：直接启动 pwsh（每个程序会获得独立的控制台窗口）。
+# 不要用 wt.exe：Windows Terminal 是打包应用且单实例，启动的进程不会进入环境。
+# Claude Code / codex 在这些终端里运行即可，会跟着进入环境。
+[[environments.proj-a.programs]]
+name = "终端"
+path = 'pwsh.exe'
+args = ['-NoExit', '-Command', 'Set-Location D:\code\proj-a']
+cwd = 'D:\code\proj-a'
+
+# ---------- 环境 proj-b ----------
+
+[[environments.proj-b.programs]]
+name = "GoLand"
+path = 'D:\idea\GoLand 2026.1\bin\goland64.exe'
+args = ['D:\code\proj-b\service']
+env = { GOLAND_PROPERTIES = '%APPDATA%\envfreeze\goland\proj-b\idea.properties' }
+
+[[environments.proj-b.programs]]
+name = "终端"
+path = 'pwsh.exe'
+args = ['-NoExit']
+cwd = 'D:\code\proj-b'
