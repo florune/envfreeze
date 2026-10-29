@@ -19,5 +19,7 @@ pub mod paths;
 mod process;
 mod state;
 pub mod status;
+pub mod stop;
 pub mod switch;
 mod win;
+mod window;

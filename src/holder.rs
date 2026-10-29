@@ -9,19 +9,21 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::iter::repeat_n;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 use windows::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, INFINITE, PROCESS_INFORMATION,
     ResumeThread, STARTUPINFOW, TerminateProcess,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::UI::Shell::{SHGFI_EXETYPE, SHGetFileInfoW};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 use crate::config::{self, Config, Program};
 use crate::job::{self, Job};
@@ -127,7 +129,11 @@ fn launch_all(config_path: &Path, env: &str) -> Result<Option<(Job, OwnedHandle)
 fn spawn_in_job(job: &Job, program: &Program) -> Result<Process> {
     let path = config::expand(&program.path);
     let args: Vec<String> = program.args.iter().map(|a| config::expand(a)).collect();
-    let mut command_line = wide(build_command_line(&path, &args));
+    // 控制台程序经由 conhost 启动时，原来的程序和参数整体作为 conhost 的参数。
+    let command_line = match console_host(&path) {
+        Some(conhost) => build_command_line(&conhost, &[std::slice::from_ref(&path), &args].concat()),
+        None => build_command_line(&path, &args),
+    };
     // 没配工作目录时用用户主目录，而不是继承 holder 的（那是执行 launch 时所在的任意目录，
     // 有些程序会往工作目录里写文件）。
     let cwd = match program.cwd.as_deref() {
@@ -136,7 +142,8 @@ fn spawn_in_job(job: &Job, program: &Program) -> Result<Process> {
     }
     .map(wide);
     let env_block = (!program.env.is_empty()).then(|| build_env_block(&program.env));
-    debug!(path, ?args, cwd = program.cwd.as_deref(), "CreateProcessW");
+    debug!(command_line, cwd = program.cwd.as_deref(), "CreateProcessW");
+    let mut command_line = wide(command_line);
 
     let startup = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, ..Default::default() };
     let mut info = PROCESS_INFORMATION::default();
@@ -169,6 +176,40 @@ fn spawn_in_job(job: &Job, program: &Program) -> Result<Process> {
         return Err(err).context("ResumeThread 失败");
     }
     Ok(process)
+}
+
+/// 控制台程序（pwsh、cmd 等）改由 conhost.exe 承载，返回 conhost.exe 的路径。
+///
+/// Windows 11 默认把新控制台转交给 Windows Terminal：窗口属于环境外的 WindowsTerminal.exe，
+/// 所有环境的终端混在同一个进程里，冻结时既隐藏不了，也分不开。直接启动 conhost.exe 不会被转交，
+/// 每个终端都有自己的窗口，并且窗口归属于环境里的进程。
+fn console_host(path: &str) -> Option<String> {
+    let resolved = resolve_exe(path)?;
+    if resolved.file_name().is_some_and(|n| n.eq_ignore_ascii_case("conhost.exe")) || !is_console_app(&resolved) {
+        return None;
+    }
+    let conhost = Path::new(&std::env::var_os("SystemRoot")?).join(r"System32\conhost.exe");
+    conhost.is_file().then(|| conhost.to_string_lossy().into_owned())
+}
+
+/// 和 CreateProcess 一样，不带目录的程序名在 PATH 里查找。
+fn resolve_exe(path: &str) -> Option<PathBuf> {
+    let p = Path::new(path);
+    if p.components().count() > 1 {
+        return p.is_file().then(|| p.to_owned());
+    }
+    let names = [p.to_owned(), p.with_extension("exe")];
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
+        .find(|c| c.is_file())
+}
+
+fn is_console_app(path: &Path) -> bool {
+    let info = unsafe {
+        SHGetFileInfoW(&HSTRING::from(path.as_os_str()), FILE_FLAGS_AND_ATTRIBUTES(0), None, 0, SHGFI_EXETYPE)
+    };
+    // 低字为 "PE"、高字（子系统版本）为 0 表示控制台程序。
+    info & 0xFFFF == 0x4550 && info >> 16 == 0
 }
 
 fn wait_until_empty(port: &OwnedHandle) -> Result<()> {

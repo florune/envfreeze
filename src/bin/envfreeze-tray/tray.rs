@@ -33,6 +33,16 @@ use crate::{icon, panel, shell};
 /// 工作线程完成一次操作后通知主线程刷新状态。
 const WM_REFRESH: u32 = WM_APP + 1;
 const POLL_INTERVAL_MS: u32 = 2000;
+/// 子菜单里最多列出这么多个隐藏窗口的标题。
+const MAX_LISTED_WINDOWS: usize = 12;
+
+/// 菜单需要的环境状态：名字、状态、冻结时隐藏的窗口标题。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnvView {
+    name: String,
+    state: EnvState,
+    hidden_windows: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 enum Command {
@@ -121,7 +131,7 @@ struct Tray {
     config: Option<Config>,
     config_error: Option<String>,
     config_mtime: Option<SystemTime>,
-    states: Vec<(String, EnvState)>,
+    states: Vec<EnvView>,
     icon: TrayIcon,
     hotkey_manager: GlobalHotKeyManager,
     registered: Vec<HotKey>,
@@ -235,11 +245,15 @@ impl Tray {
 
     /// 读取各环境状态；状态或配置变化时重建菜单、图标和提示。
     fn refresh(&mut self, force: bool) {
-        let states: Vec<(String, EnvState)> = match &self.config {
+        let states: Vec<EnvView> = match &self.config {
             Some(config) => config
                 .environments
                 .keys()
-                .map(|name| (name.clone(), status::env_state(name).unwrap_or(EnvState::Stopped)))
+                .map(|name| EnvView {
+                    name: name.clone(),
+                    state: status::env_state(name).unwrap_or(EnvState::Stopped),
+                    hidden_windows: status::hidden_windows(name).unwrap_or_default(),
+                })
                 .collect(),
             None => Vec::new(),
         };
@@ -248,7 +262,7 @@ impl Tray {
             return;
         }
         self.states = states;
-        let only_states: Vec<EnvState> = self.states.iter().map(|(_, s)| *s).collect();
+        let only_states: Vec<EnvState> = self.states.iter().map(|s| s.state).collect();
         let _ = self.icon.set_icon(Some(icon::render(icon::color_for(&only_states))));
         let menu = self.build_menu();
         self.icon.set_menu(Some(Box::new(menu)));
@@ -257,7 +271,7 @@ impl Tray {
 
     fn update_tooltip(&self) {
         let names = |wanted: EnvState| -> String {
-            let v: Vec<&str> = self.states.iter().filter(|(_, s)| *s == wanted).map(|(n, _)| n.as_str()).collect();
+            let v: Vec<&str> = self.states.iter().filter(|s| s.state == wanted).map(|s| s.name.as_str()).collect();
             if v.is_empty() { "无".into() } else { v.join(", ") }
         };
         let mut tip = format!("envfreeze\n运行中：{}\n已冻结：{}", names(EnvState::Running), names(EnvState::Frozen));
@@ -275,7 +289,7 @@ impl Tray {
         let hotkey_hint = |k: Option<&String>| k.map(|k| format!("\t{k}")).unwrap_or_default();
 
         let active: Vec<&str> =
-            self.states.iter().filter(|(_, s)| *s == EnvState::Running).map(|(n, _)| n.as_str()).collect();
+            self.states.iter().filter(|s| s.state == EnvState::Running).map(|s| s.name.as_str()).collect();
         let header = if active.is_empty() {
             "envfreeze".to_string()
         } else {
@@ -288,28 +302,47 @@ impl Tray {
             let short: String = err.chars().take(60).collect();
             append(&menu, &MenuItem::new(format!("配置有误：{short}"), false, None));
         }
-        let envs: Vec<(String, EnvState, Option<String>)> = self
+        let envs: Vec<(EnvView, Option<String>)> = self
             .states
             .iter()
-            .map(|(name, state)| {
-                let hotkey = self.config.as_ref().and_then(|c| c.environments.get(name)).and_then(|e| e.hotkey.clone());
-                (name.clone(), *state, hotkey)
+            .map(|view| {
+                let env = self.config.as_ref().and_then(|c| c.environments.get(&view.name));
+                (view.clone(), env.and_then(|e| e.hotkey.clone()))
             })
             .collect();
         if envs.is_empty() {
             append(&menu, &MenuItem::new("（配置中还没有环境）", false, None));
         }
-        for (name, state, hotkey) in envs {
-            let sub = Submenu::new(format!("{name}（{}）", state.label()), true);
+        for (EnvView { name, state, hidden_windows }, hotkey) in envs {
+            let label = if hidden_windows.is_empty() {
+                format!("{name}（{}）", state.label())
+            } else {
+                format!("{name}（{} · {} 个窗口）", state.label(), hidden_windows.len())
+            };
+            let sub = Submenu::new(label, true);
             let items = [
                 (format!("切换到此环境{}", hotkey_hint(hotkey.as_ref())), EnvOp::Switch(name.clone()), true),
                 ("启动".into(), EnvOp::Launch(name.clone()), state == EnvState::Stopped),
                 ("冻结".into(), EnvOp::Freeze(name.clone()), state == EnvState::Running),
                 ("恢复".into(), EnvOp::Thaw(name.clone()), matches!(state, EnvState::Frozen | EnvState::Orphaned)),
+                ("关闭环境".into(), EnvOp::Stop(name.clone()), matches!(state, EnvState::Running | EnvState::Frozen)),
             ];
             for (text, op, enabled) in items {
                 let item = self.item(text, Command::Env(op), enabled);
                 let _ = sub.append(&item);
+            }
+            if !hidden_windows.is_empty() {
+                // 只做展示：让人知道这个环境里藏着哪些窗口。
+                let _ = sub.append(&PredefinedMenuItem::separator());
+                let _ = sub.append(&MenuItem::new("隐藏的窗口：", false, None));
+                for title in hidden_windows.iter().take(MAX_LISTED_WINDOWS) {
+                    let title: String = title.chars().take(60).collect();
+                    let _ = sub.append(&MenuItem::new(format!("    {title}"), false, None));
+                }
+                if hidden_windows.len() > MAX_LISTED_WINDOWS {
+                    let more = format!("    …还有 {} 个", hidden_windows.len() - MAX_LISTED_WINDOWS);
+                    let _ = sub.append(&MenuItem::new(more, false, None));
+                }
             }
             append(&menu, &sub);
         }

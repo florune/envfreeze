@@ -104,6 +104,8 @@ struct PanelApp {
     new_env: String,
     /// 等待二次确认删除的环境。
     confirm_delete: Option<String>,
+    /// 等待二次确认强制结束的环境。
+    confirm_kill: Option<String>,
 }
 
 /// 环境页上对配置的修改，在界面绘制完后统一执行。
@@ -133,6 +135,7 @@ impl PanelApp {
             picker: None,
             new_env: String::new(),
             confirm_delete: None,
+            confirm_kill: None,
         };
         app.refresh(true);
         app
@@ -406,8 +409,46 @@ impl PanelApp {
                         if ui.add_enabled(thawable, egui::Button::new("恢复")).clicked() {
                             op = Some(EnvOp::Thaw(s.name.clone()));
                         }
+                        let alive = matches!(s.state, EnvState::Running | EnvState::Frozen);
+                        let stop = ui
+                            .add_enabled(alive, egui::Button::new("关闭环境"))
+                            .on_hover_text("像点 X 一样关闭所有窗口，等程序保存后自行退出；冻结中的会先恢复");
+                        if stop.clicked() {
+                            op = Some(EnvOp::Stop(s.name.clone()));
+                        }
+                        if !alive {
+                            return;
+                        }
+                        if self.confirm_kill.as_deref() == Some(s.name.as_str()) {
+                            let danger = RichText::new("确认强制结束（未保存的内容会丢失）")
+                                .color(Color32::from_rgb(220, 70, 70));
+                            if ui.button(danger).clicked() {
+                                self.confirm_kill = None;
+                                op = Some(EnvOp::Kill(s.name.clone()));
+                            }
+                            if ui.button("取消").clicked() {
+                                self.confirm_kill = None;
+                            }
+                        } else if ui
+                            .button("强制结束…")
+                            .on_hover_text("程序没响应或一直不退出时使用：立即结束环境里的所有进程")
+                            .clicked()
+                        {
+                            self.confirm_kill = Some(s.name.clone());
+                        }
                     });
                 });
+
+                if !s.hidden_windows.is_empty() {
+                    egui::CollapsingHeader::new(format!("隐藏的窗口（{}）", s.hidden_windows.len()))
+                        .id_salt(("hidden", &s.name))
+                        .show(ui, |ui| {
+                            ui.weak("冻结时隐藏，恢复或切换到本环境时原样显示。");
+                            for title in &s.hidden_windows {
+                                ui.add(egui::Label::new(title).truncate());
+                            }
+                        });
+                }
 
                 let programs = env_config.map(|e| e.programs.as_slice()).unwrap_or_default();
                 let stopped = s.state == EnvState::Stopped;

@@ -5,7 +5,7 @@ use std::path::Path;
 use envfreeze::config::Config;
 use envfreeze::launch::{LaunchReport, Level};
 use envfreeze::switch::{self, Action, Batch};
-use envfreeze::{freeze, launch};
+use envfreeze::{freeze, launch, stop};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvOp {
@@ -13,6 +13,10 @@ pub enum EnvOp {
     Launch(String),
     Freeze(String),
     Thaw(String),
+    /// 关闭窗口，等程序自行退出。
+    Stop(String),
+    /// 强制结束全部进程。
+    Kill(String),
     FreezeAll,
 }
 
@@ -23,6 +27,8 @@ impl EnvOp {
             EnvOp::Launch(env) => format!("启动 {env}"),
             EnvOp::Freeze(env) => format!("冻结 {env}"),
             EnvOp::Thaw(env) => format!("恢复 {env}"),
+            EnvOp::Stop(env) => format!("关闭 {env}"),
+            EnvOp::Kill(env) => format!("强制结束 {env}"),
             EnvOp::FreezeAll => "冻结全部环境".into(),
         }
     }
@@ -44,6 +50,14 @@ pub fn execute(config_path: &Path, op: &EnvOp) -> OpResult {
             Config::load(config_path).and_then(|config| switch::freeze_env(&config, env)).map(|r| (r.ok(), r.summary()))
         }
         EnvOp::Thaw(env) => freeze::thaw(env).map(|r| (r.ok(), r.summary())),
+        EnvOp::Stop(env) => stop::stop(env, stop::DEFAULT_TIMEOUT, false).map(|r| {
+            let mut body = r.summary();
+            if !r.remaining.is_empty() {
+                body += "\n程序可能在等你确认；也可以在面板里强制结束";
+            }
+            (r.ok(), body)
+        }),
+        EnvOp::Kill(env) => stop::kill(env).map(|r| (r.ok(), r.summary())),
     };
     match result {
         Ok((ok, body)) => OpResult { ok, title, body },

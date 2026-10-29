@@ -44,6 +44,8 @@ pub struct EnvStatus {
     pub name: String,
     pub state: EnvState,
     pub processes: Vec<ProcessStatus>,
+    /// 冻结时隐藏的任务栏窗口的标题，按 Z 序从上到下。
+    pub hidden_windows: Vec<String>,
 }
 
 impl EnvStatus {
@@ -63,6 +65,12 @@ pub fn env_state(env: &str) -> Result<EnvState> {
     })
 }
 
+/// 冻结时隐藏的任务栏窗口的标题，没有冻结记录时为空。
+pub fn hidden_windows(env: &str) -> Result<Vec<String>> {
+    let record = state::read(env)?.unwrap_or_default();
+    Ok(record.windows.into_iter().filter(|w| w.in_taskbar).map(|w| w.title).collect())
+}
+
 pub fn env_status(config: &Config, env: &str) -> Result<EnvStatus> {
     let rules = ExcludeRules::for_env(config, env);
     let state = env_state(env)?;
@@ -80,7 +88,7 @@ pub fn env_status(config: &Config, env: &str) -> Result<EnvStatus> {
         }
     }
     processes.sort_by_key(|p| std::cmp::Reverse(p.memory.working_set));
-    Ok(EnvStatus { name: env.to_owned(), state, processes })
+    Ok(EnvStatus { name: env.to_owned(), state, processes, hidden_windows: hidden_windows(env)? })
 }
 
 pub fn all(config: &Config) -> Result<Vec<EnvStatus>> {

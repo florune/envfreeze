@@ -17,8 +17,9 @@ use crate::guard;
 use crate::job::Job;
 use crate::memory::{self, Memory, fmt_bytes};
 use crate::process::Process;
-use crate::state::{self, FrozenProcess};
+use crate::state::{self, FrozenProcess, HiddenWindow, Record};
 use crate::win::{describe, is_win32};
+use crate::window;
 
 const FREEZE_ACCESS: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(PROCESS_SUSPEND_RESUME.0 | PROCESS_QUERY_LIMITED_INFORMATION.0 | PROCESS_SET_QUOTA.0);
@@ -27,6 +28,10 @@ const THAW_ACCESS: PROCESS_ACCESS_RIGHTS =
 
 /// 挂起过程中进程可能继续派生子进程，反复枚举直到没有新 PID，最多这么多轮。
 const MAX_ROUNDS: usize = 10;
+/// 隐藏窗口时程序可能又弹出新窗口，最多补这么多轮。
+const HIDE_ROUNDS: usize = 3;
+const HIDE_TIMEOUT: Duration = Duration::from_millis(1500);
+const SHOW_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub struct Failure {
@@ -59,6 +64,10 @@ pub struct FreezeReport {
     pub frozen: Vec<FrozenRow>,
     pub skipped: Vec<Skipped>,
     pub failures: Vec<Failure>,
+    /// 隐藏的窗口（包括白名单进程的窗口），按 Z 序从上到下。
+    pub hidden: Vec<HiddenWindow>,
+    /// 超时后仍未隐藏的窗口数：程序未响应，冻结后会留下"未响应"的窗口。
+    pub stuck_windows: usize,
     /// 多轮枚举后仍有新进程出现。
     pub unstable: bool,
     pub available_before: Option<u64>,
@@ -72,6 +81,11 @@ impl FreezeReport {
         self.failures.is_empty()
     }
 
+    /// 隐藏的任务栏窗口数（不算对话框、输入法窗口等）。
+    pub fn taskbar_windows(&self) -> usize {
+        self.hidden.iter().filter(|w| w.in_taskbar).count()
+    }
+
     /// 工作集释放量。
     pub fn released(&self) -> u64 {
         self.frozen.iter().map(|r| r.before.working_set.saturating_sub(r.after.working_set)).sum()
@@ -82,6 +96,13 @@ impl FreezeReport {
             return format!("{}：已处于冻结状态", self.env);
         }
         let mut s = format!("{}：冻结 {} 个进程，释放 {}", self.env, self.frozen.len(), fmt_bytes(self.released()));
+        let windows = self.taskbar_windows();
+        if windows > 0 {
+            s += &format!("，隐藏 {windows} 个窗口");
+        }
+        if self.stuck_windows > 0 {
+            s += &format!("（{} 个未响应，没能隐藏）", self.stuck_windows);
+        }
         if !self.skipped.is_empty() {
             s += &format!("，跳过 {} 个", self.skipped.len());
         }
@@ -96,6 +117,8 @@ impl FreezeReport {
 pub struct ThawReport {
     pub env: String,
     pub resumed: usize,
+    /// 重新显示的任务栏窗口数。
+    pub shown_windows: usize,
     pub failures: Vec<Failure>,
     pub elapsed: Duration,
     /// 恢复前存在冻结记录。
@@ -111,6 +134,9 @@ impl ThawReport {
 
     pub fn summary(&self) -> String {
         let mut s = format!("{}：恢复 {} 个进程", self.env, self.resumed);
+        if self.shown_windows > 0 {
+            s += &format!("，显示 {} 个窗口", self.shown_windows);
+        }
         if !self.failures.is_empty() {
             s += &format!("，失败 {} 个（可重试）", self.failures.len());
         }
@@ -138,6 +164,8 @@ pub fn freeze(env: &str, rules: &ExcludeRules) -> Result<FreezeReport> {
         frozen: Vec::new(),
         skipped: Vec::new(),
         failures: Vec::new(),
+        hidden: Vec::new(),
+        stuck_windows: 0,
         unstable: false,
         available_before: None,
         available_after: None,
@@ -151,6 +179,10 @@ pub fn freeze(env: &str, rules: &ExcludeRules) -> Result<FreezeReport> {
     }
 
     report.available_before = memory::available_physical();
+    // 先隐藏窗口：隐藏要靠进程自己处理消息，挂起之后就来不及了。
+    let mut record = Record::default();
+    report.stuck_windows = hide_windows(env, &job.pids()?, &mut record);
+
     let started = Instant::now();
     let mut seen = HashSet::new();
     let mut suspended = Vec::new();
@@ -175,13 +207,17 @@ pub fn freeze(env: &str, rules: &ExcludeRules) -> Result<FreezeReport> {
     }
     report.suspend_elapsed = started.elapsed();
 
-    if suspended.is_empty() {
-        // 全部被跳过或失败：没有挂起任何进程，不写冻结记录。
+    if suspended.is_empty() && (record.windows.is_empty() || !report.failures.is_empty()) {
+        // 一个进程都没挂起：把窗口还原，当作没冻结过，不留冻结记录。
+        // （全部命中白名单时例外：进程照常运行，窗口保持隐藏，恢复时再显示。）
+        window::show(&record.windows, record.foreground, SHOW_TIMEOUT);
+        state::clear(env)?;
         return Ok(report);
     }
+    report.hidden = record.windows.clone();
     // 先落盘再清空工作集：即使后续步骤出问题，thaw 也知道要恢复哪些进程。
-    let records: Vec<FrozenProcess> = suspended.iter().map(|s| s.record.clone()).collect();
-    if let Err(e) = state::write(env, &records) {
+    record.processes = suspended.iter().map(|s| s.record.clone()).collect();
+    if let Err(e) = state::write(env, &record) {
         warn!("{e:#}；thaw 仍可通过 Job 恢复进程，但无法防止重复冻结");
     }
 
@@ -200,6 +236,32 @@ pub fn freeze(env: &str, rules: &ExcludeRules) -> Result<FreezeReport> {
     report.trim_elapsed = trim_started.elapsed();
     report.available_after = memory::available_physical();
     Ok(report)
+}
+
+/// 隐藏环境里所有进程（包括白名单进程）的可见窗口，返回没能隐藏的窗口数。
+///
+/// 每批窗口隐藏之前先写冻结记录：哪怕中途崩溃，thaw 也能把它们找回来。
+fn hide_windows(env: &str, pids: &[u32], record: &mut Record) -> usize {
+    let owners = guard::unprotected(pids);
+    record.foreground = window::foreground_of(&owners);
+    let mut stuck = 0;
+    for _ in 0..HIDE_ROUNDS {
+        let new: Vec<HiddenWindow> =
+            window::visible(&owners).into_iter().filter(|w| !record.windows.iter().any(|r| r.hwnd == w.hwnd)).collect();
+        if new.is_empty() {
+            break;
+        }
+        record.windows.extend(new.iter().cloned());
+        if let Err(e) = state::write(env, record) {
+            warn!("{e:#}；窗口仍会隐藏，但中途出错时 thaw 可能找不回它们");
+        }
+        window::hide(&new);
+        stuck = window::wait_hidden(&record.windows, HIDE_TIMEOUT);
+    }
+    if stuck > 0 {
+        warn!(stuck, "部分窗口没能隐藏，程序可能未响应");
+    }
+    stuck
 }
 
 fn suspend_one(pid: u32, rules: &ExcludeRules) -> Outcome<Suspended> {
@@ -229,7 +291,8 @@ fn suspend_one(pid: u32, rules: &ExcludeRules) -> Outcome<Suspended> {
 }
 
 pub fn thaw(env: &str) -> Result<ThawReport> {
-    let records = state::read(env)?;
+    let record = state::read(env)?;
+    let records = record.as_ref().map(|r| &r.processes);
     let job = Job::open(env)?;
 
     // (PID, 期望的创建时间)。来自 Job 的进程不需要校验创建时间。
@@ -260,9 +323,12 @@ pub fn thaw(env: &str) -> Result<ThawReport> {
             Outcome::Failed(f) => failures.push(f),
         }
     }
+    // 先恢复再显示：显示同样要靠进程自己处理消息。
+    let shown_windows = record.as_ref().map_or(0, |r| window::show(&r.windows, r.foreground, SHOW_TIMEOUT));
     let report = ThawReport {
         env: env.to_owned(),
         resumed,
+        shown_windows,
         failures,
         elapsed: started.elapsed(),
         had_record: records.is_some(),

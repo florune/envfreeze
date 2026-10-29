@@ -9,6 +9,7 @@ use envfreeze::config::{self, Config};
 use envfreeze::freeze::{Failure, FreezeReport, ThawReport};
 use envfreeze::launch::{LaunchReport, Level};
 use envfreeze::memory::{fmt_bytes, fmt_delta};
+use envfreeze::stop::{self, StopReport};
 use envfreeze::switch::{self, Action, Batch};
 use envfreeze::{freeze, holder, launch, paths, status};
 use tracing_subscriber::EnvFilter;
@@ -36,6 +37,18 @@ enum Command {
     Freeze { env: String },
     /// 恢复环境中的所有进程
     Thaw { env: String },
+    /// 关闭环境：冻结中先恢复，再关闭所有窗口，等程序自行退出
+    Stop {
+        env: String,
+        /// 等待程序自行退出的秒数
+        #[arg(long, default_value_t = stop::DEFAULT_TIMEOUT.as_secs())]
+        timeout: u64,
+        /// 超时后强制结束仍未退出的进程（未保存的内容会丢失）
+        #[arg(long)]
+        force: bool,
+    },
+    /// 立即强制结束环境中的所有进程，不等程序保存（未保存的内容会丢失）
+    Kill { env: String },
     /// 切换到环境：冻结其他运行中的环境，再启动或恢复目标环境
     Switch { env: String },
     /// 冻结所有运行中的环境
@@ -98,6 +111,18 @@ fn run(cli: Cli) -> Result<bool> {
             print_thaw(&report);
             Ok(report.ok())
         }
+        Command::Stop { env, timeout, force } => {
+            config::validate_env_name(env)?;
+            let report = stop::stop(env, std::time::Duration::from_secs(*timeout), *force)?;
+            print_stop(&report);
+            Ok(report.ok())
+        }
+        Command::Kill { env } => {
+            config::validate_env_name(env)?;
+            let report = stop::kill(env)?;
+            print_stop(&report);
+            Ok(report.ok())
+        }
         Command::Switch { env } => {
             config::validate_env_name(env)?;
             let batch = switch::switch(&config_path, env)?;
@@ -156,6 +181,13 @@ fn print_freeze(r: &FreezeReport) {
     for s in &r.skipped {
         println!("  跳过 PID {} {}：{}", s.pid, s.name, s.reason);
     }
+    if r.taskbar_windows() > 0 {
+        let titles: Vec<&str> = r.hidden.iter().filter(|w| w.in_taskbar).map(|w| w.title.as_str()).collect();
+        println!("隐藏 {} 个窗口（恢复时原样显示）：{}", titles.len(), titles.join("、"));
+    }
+    if r.stuck_windows > 0 {
+        println!("  ! {} 个窗口没能隐藏：程序当时未响应，冻结后会显示「未响应」", r.stuck_windows);
+    }
     if let (Some(b), Some(a)) = (r.available_before, r.available_after) {
         println!("系统可用物理内存：{} → {}（{}）", fmt_bytes(b), fmt_bytes(a), fmt_delta(b, a));
         println!("  注：被换出的页面会先进入修改列表/内存压缩，可用内存可能在之后几秒内继续上升");
@@ -174,12 +206,41 @@ fn print_thaw(r: &ThawReport) {
     if !r.had_record {
         println!("环境 `{}` 没有冻结记录，仍对其中所有进程执行了一次恢复", r.env);
     }
-    println!("已恢复环境 `{}`：{} 个进程，用时 {} ms", r.env, r.resumed, r.elapsed.as_millis());
+    println!(
+        "已恢复环境 `{}`：{} 个进程，显示 {} 个窗口，用时 {} ms",
+        r.env,
+        r.resumed,
+        r.shown_windows,
+        r.elapsed.as_millis()
+    );
     println!("  注：内存会在程序被使用时按需换入，首次切回窗口可能有短暂卡顿");
     print_failures(&r.failures);
     if !r.ok() {
         println!("冻结记录已保留，可再次执行 `envfreeze thaw {}` 重试", r.env);
     }
+}
+
+fn print_stop(r: &StopReport) {
+    if let Some(thawed) = &r.thawed {
+        print_thaw(thawed);
+    }
+    if r.closed_windows > 0 {
+        println!("已请求关闭 {} 个窗口", r.closed_windows);
+    }
+    if r.killed > 0 {
+        println!("强制结束 {} 个进程", r.killed);
+    }
+    if r.remaining.is_empty() {
+        println!("环境 `{}` 已关闭，用时 {} ms", r.env, r.elapsed.as_millis());
+    } else {
+        println!("环境 `{}` 还有 {} 个进程没有退出：", r.env, r.remaining.len());
+        for l in &r.remaining {
+            println!("  PID {} {}", l.pid, l.name);
+        }
+        println!("  程序可能正在等你确认（例如保存或退出提示），处理后再执行一次 stop；");
+        println!("  或者执行 `envfreeze kill {}` 强制结束（未保存的内容会丢失）", r.env);
+    }
+    print_failures(&r.failures);
 }
 
 fn print_batch(batch: &Batch) {
@@ -232,6 +293,12 @@ fn print_status_detail(config: &Config, env: &str) -> Result<()> {
     config.env(env)?;
     let s = status::env_status(config, env)?;
     println!("环境 `{env}`：{}，{} 个进程", s.state.label(), s.processes.len());
+    if !s.hidden_windows.is_empty() {
+        println!("隐藏的窗口：");
+        for title in &s.hidden_windows {
+            println!("  {title}");
+        }
+    }
     if s.processes.is_empty() {
         return Ok(());
     }

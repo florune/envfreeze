@@ -3,6 +3,12 @@
 //! 正常情况下 Job 里只有本工具启动的程序，这里是兜底，
 //! 防止 shell 打开文件夹之类的操作把系统进程带进环境。
 
+use std::collections::HashSet;
+
+use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+
+use crate::process::Process;
+
 /// 小写的映像文件名。
 const PROTECTED: &[&str] = &[
     "system",
@@ -41,6 +47,17 @@ pub fn protected_reason(pid: u32, image_name: Option<&str>) -> Option<&'static s
     }
     let name = image_name?.to_ascii_lowercase();
     PROTECTED.contains(&name.as_str()).then_some("白名单进程")
+}
+
+/// 去掉其中受保护的进程。
+pub fn unprotected(pids: &[u32]) -> HashSet<u32> {
+    pids.iter()
+        .copied()
+        .filter(|&pid| {
+            let name = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok().and_then(|p| p.image_name());
+            protected_reason(pid, name.as_deref()).is_none()
+        })
+        .collect()
 }
 
 #[cfg(test)]
