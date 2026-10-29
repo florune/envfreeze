@@ -1,0 +1,3 @@
+# 静态链接 MSVC 运行库：发布的 exe 不依赖 VC++ 运行库，拷到任何 Windows 10/11 x64 上都能直接运行。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
